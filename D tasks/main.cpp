@@ -20,7 +20,7 @@
 static const int WALL = 1;
 static const int ROAD = 0;
 
-// ==================== 读取顶层二维数组 ====================
+// Load the top level two dimensional array from a json file
 std::vector<std::vector<int>> load_maze(const std::string &path)
 {
     std::ifstream in(path);
@@ -44,17 +44,17 @@ std::vector<std::vector<int>> load_maze(const std::string &path)
     return g;
 }
 
-// ==================== 查找唯一出口（边界上的唯一 ROAD） ====================
+// Find the single exit cell which must be the only ROAD on the border
 std::pair<int,int> find_exit_cell(const std::vector<std::vector<int>> &g)
 {
     int H = (int)g.size(), W = (int)g[0].size();
     std::vector<std::pair<int,int>> exits;
-    // 上下边
+    // Top and bottom borders
     for (int c=0;c<W;++c){
         if (g[0][c]==ROAD) exits.emplace_back(0,c);
         if (g[H-1][c]==ROAD) exits.emplace_back(H-1,c);
     }
-    // 左右边
+    // Left and right borders
     for (int r=0;r<H;++r){
         if (g[r][0]==ROAD) exits.emplace_back(r,0);
         if (g[r][W-1]==ROAD) exits.emplace_back(r,W-1);
@@ -63,7 +63,7 @@ std::pair<int,int> find_exit_cell(const std::vector<std::vector<int>> &g)
     return exits[0];
 }
 
-// ==================== 随机路格 ====================
+// Pick a random road cell from all ROAD cells
 std::pair<int,int> random_road(const std::vector<std::vector<int>> &g, std::mt19937 &rng)
 {
     int H = (int)g.size(), W = (int)g[0].size();
@@ -77,7 +77,7 @@ std::pair<int,int> random_road(const std::vector<std::vector<int>> &g, std::mt19
     return roads[dist(rng)];
 }
 
-// ==================== 调 Python（同步）返回 JSON ====================
+// Call the python script in a blocking way and parse returned json
 nlohmann::json run_python_next_step(const std::string &maze_path, int from_r, int from_c, int to_r, int to_c)
 {
     std::ostringstream cmd;
@@ -107,7 +107,7 @@ nlohmann::json run_python_next_step(const std::string &maze_path, int from_r, in
     return nlohmann::json::parse(output);
 }
 
-// ==================== 让 Python 生成 maze.json（指定尺寸与环密度） ====================
+// Ask python to generate maze.json with given size and loop density
 void run_python_generate_maze(const std::string &out_path, int H, int W, double loop_density = 0.08)
 {
     std::ostringstream cmd;
@@ -123,7 +123,7 @@ void run_python_generate_maze(const std::string &out_path, int H, int W, double 
 #endif
     if (!pipe) throw std::runtime_error("failed to run python generate");
     char buf[256];
-    while (fgets(buf, (int)sizeof(buf), pipe)) { /* 可在此打印日志：puts(buf); */ }
+    while (fgets(buf, (int)sizeof(buf), pipe)) { /* You can print logs here such as puts with buf */ }
 #if defined(_WIN32)
     _pclose(pipe);
 #else
@@ -131,23 +131,23 @@ void run_python_generate_maze(const std::string &out_path, int H, int W, double 
 #endif
 }
 
-// ==================== 平滑移动器（网格 + 像素插值） ====================
+// Smooth mover that operates on grid cells with pixel interpolation for rendering
 struct Mover {
-    // 网格坐标（格为单位）
+    // Grid coordinates in cell units
     int r{0}, c{0};
-    int tr{0}, tc{0};     // 目标格（移动完成时写入 r,c）
+    int tr{0}, tc{0};     // Target cell to commit to r and c after movement completes
 
-    // 像素坐标（渲染使用）
+    // Pixel coordinates for rendering
     float x{0}, y{0};
-    float sx{0}, sy{0};   // 起点像素
-    float tx{0}, ty{0};   // 终点像素
+    float sx{0}, sy{0};   // Pixel start position
+    float tx{0}, ty{0};   // Pixel target position
 
-    // 进度（0~1）
+    // Progress from zero to one
     float t{0};
     bool moving{false};
 
-    // 速度（像素/秒）
-    float speed{160.0f};  // 玩家默认 160px/s，TILE=32 即 5格/秒
+    // Speed in pixels per second
+    float speed{160.0f};  // Player default is one hundred sixty pixels per second. With TILE as thirty two this is five cells per second
 };
 
 static int TILE = 32;
@@ -166,7 +166,7 @@ void start_move(Mover &m, int nr, int nc)
     m.moving = true;
 }
 
-void snap_to_cell(Mover &m) // 立即对齐到当前 r,c 的像素位置
+void snap_to_cell(Mover &m) // Immediately align pixel position to current r and c
 {
     m.tr = m.r; m.tc = m.c;
     m.x = cell_to_px_c(m.c);
@@ -180,7 +180,7 @@ void snap_to_cell(Mover &m) // 立即对齐到当前 r,c 的像素位置
 void update_mover(Mover &m, float dt)
 {
     if (!m.moving) return;
-    // 每秒 speed 像素；跨一个格需要 TILE 像素 => t 增量 = (speed*dt)/TILE
+    // Speed is in pixels per second. One cell takes TILE pixels. Therefore t increases by speed times dt divided by TILE
     m.t += (m.speed * dt) / (float)TILE;
     if (m.t >= 1.0f) {
         m.t = 1.0f;
@@ -199,9 +199,9 @@ int main()
         std::cout << "cwd: " << std::filesystem::current_path().string() << "\n";
         const std::string maze_file = "maze.json";
 
-        // ---------- 首次运行自动生成地图（如果不存在或读取失败） ----------
+        // Auto generate the map on first run if the file is missing or cannot be read
         if (!std::filesystem::exists(maze_file)) {
-            // 首次没有文件：按默认 20x20 生成
+            // No file on first run. Generate default twenty by twenty
             run_python_generate_maze(maze_file, 20, 20, 0.08);
         }
 
@@ -209,7 +209,7 @@ int main()
         try {
             maze = load_maze(maze_file);
         } catch (...) {
-            // 文件存在但内容坏了/格式不对：重新生成再读
+            // File exists but is corrupted or has a wrong format. Regenerate and read again
             run_python_generate_maze(maze_file, 20, 20, 0.08);
             maze = load_maze(maze_file);
         }
@@ -219,14 +219,14 @@ int main()
         auto exit_cell = find_exit_cell(maze);
         int exit_r = exit_cell.first, exit_c = exit_cell.second;
 
-        // 画面
+        // Screen setup
         TILE = 32;
         PADDING = 0;
         const int SCR_W = W * TILE + PADDING*2;
         const int SCR_H = H * TILE + PADDING*2;
         open_window("Maze Chase (smooth + async A*)", SCR_W, SCR_H);
 
-        // 贴图
+        // Textures and sprites
         bitmap floor_bmp   = load_bitmap("floor",   "Floor.bmp");
         bitmap wall_bmp    = load_bitmap("wall",    "Wall.bmp");
         bitmap player_bmp  = load_bitmap("player",  "Player.bmp");
@@ -248,7 +248,7 @@ int main()
         drawing_options opt_player  = scale_for(player_bmp);
         drawing_options opt_monster = scale_for(monster_bmp);
 
-        // 出生
+        // Spawn points for player and monster on road cells
         std::random_device rd; std::mt19937 rng(rd());
         auto pspawn = random_road(maze, rng);
         auto mspawn = random_road(maze, rng);
@@ -259,20 +259,20 @@ int main()
         player.c = player.tc = pspawn.second;
         player.x = cell_to_px_c(player.c);
         player.y = cell_to_px_r(player.r);
-        player.speed = 180.0f; // 玩家更快点：~5.6 格/秒
+        player.speed = 180.0f; // Player is a little faster which is about five point six cells per second
 
         Mover monster;
         monster.r = monster.tr = mspawn.first;
         monster.c = monster.tc = mspawn.second;
         monster.x = cell_to_px_c(monster.c);
         monster.y = cell_to_px_r(monster.r);
-        monster.speed = 140.0f; // 怪物稍慢
+        monster.speed = 140.0f; // Monster is slightly slower
 
         bool game_over = false;
         bool victory   = false;
 
-        // === AI 异步：每隔一定时间请求一次 A*，不阻塞主循环 ===
-        const double AI_INTERVAL = 0.18; // 秒；越小越“跟手”
+        // Asynchronous AI. Request a star periodically so the main loop is never blocked
+        const double AI_INTERVAL = 0.18; // Seconds. A smaller value tracks more closely
         double ai_accum = 0.0;
         bool ai_running = false;
         std::future<nlohmann::json> ai_future;
@@ -289,7 +289,7 @@ int main()
         };
 
         auto reset_round = [&](){
-            // 重新生成迷宫 -> 重新读取 -> 重置状态（维持尺寸不变）
+            // Regenerate the maze then reload it and reset state while keeping the current size
             run_python_generate_maze(maze_file, H, W, 0.08);
             maze = load_maze(maze_file);
             auto ex = find_exit_cell(maze);
@@ -307,27 +307,27 @@ int main()
             monster.c = monster.tc = mspawn.second;
             snap_to_cell(monster);
 
-            // 重置状态
+            // Reset round state
             game_over = false;
             victory = false;
             ai_accum = 0.0;
             ai_running = false;
         };
 
-        // 帧时间
+        // Frame timing
         auto last = std::chrono::steady_clock::now();
 
         while (!window_close_requested("Maze Chase (smooth + async A*)"))
         {
             process_events();
 
-            // 计算 dt（秒）
+            // Compute dt in seconds
             auto now = std::chrono::steady_clock::now();
             float dt = std::chrono::duration<float>(now - last).count();
             last = now;
-            dt = std::min(dt, 0.05f); // 防止极端卡顿导致穿模
+            dt = std::min(dt, 0.05f); // Prevent extreme frame gaps that may cause tunneling
 
-            // 胜利/失败界面输入：优先处理
+            // Input handling while on win or loss screens takes priority
             if (victory) {
                 if (key_typed(Y_KEY)) { reset_round(); }
                 else if (key_typed(N_KEY) || key_typed(ESCAPE_KEY)) { break; }
@@ -335,7 +335,7 @@ int main()
                 if (key_typed(Y_KEY)) { reset_round(); }
                 else if (key_typed(N_KEY) || key_typed(ESCAPE_KEY)) { break; }
             } else {
-                // --- 玩家输入（平滑格间移动；按住方向键连续走） ---
+                // Player input. Grid to grid with smooth interpolation. Holding a direction keeps moving
                 if (!player.moving)
                 {
                     int dr = 0, dc = 0;
@@ -352,7 +352,7 @@ int main()
                     }
                 }
 
-                // --- 怪物移动（使用上一次算好的目标；若无则等待 AI） ---
+                // Monster movement uses the previously computed target. If none is available it waits for AI
                 if (!monster.moving)
                 {
                     if (ai_running &&
@@ -373,29 +373,29 @@ int main()
                     }
                 }
 
-                // --- 累计 AI 调度时间，到点且未在算时再发起新请求 ---
+                // Accumulate AI scheduling time and trigger a new request when the interval elapses and no request is running
                 ai_accum += dt;
                 if (!ai_running && ai_accum >= AI_INTERVAL) request_ai();
             }
 
-            // --- 更新平滑移动 ---
+            // Update smooth movement for both entities
             update_mover(player, dt);
             update_mover(monster, dt);
 
-            // --- 终点/失败判定（胜利优先于失败） ---
+            // Win and loss checks. Win has priority over loss
             if (!victory && player.r == exit_r && player.c == exit_c) {
                 victory = true;
-                ai_running = false;  // 停止进一步 AI
+                ai_running = false;  // Stop further AI
             }
             if (!victory && !game_over && player.r == monster.r && player.c == monster.c) {
                 game_over = true;
                 ai_running = false;
             }
 
-        // --- 渲染 ---
+        // Rendering starts here
         if (victory || game_over)
         {
-            // 先清屏再只显示文字提示
+            // Clear the screen first and draw only the informational text
             clear_screen(COLOR_BLACK);
 
             if (victory) {
@@ -407,14 +407,14 @@ int main()
             }
 
             refresh_screen(60);
-            // 跳过当前帧的地图与角色绘制，保持纯文字背景
+            // Skip map and actor rendering for this frame to keep a clean text overlay
             continue; 
         }
 
-        // ---- 正常渲染地图与角色（胜利/失败时不会走到这里） ----
+        // Normal rendering of map and actors. This path is not used on win or loss frames
         clear_screen(COLOR_BLACK);
 
-// 地图
+// Map tiles
 for (int r=0;r<H;++r)
 for (int c=0;c<W;++c)
 {
@@ -432,18 +432,18 @@ for (int c=0;c<W;++c)
     }
 }
 
-// 玩家
+// Player sprite or fallback
 if (bitmap_valid(player_bmp)) draw_bitmap(player_bmp, player.x, player.y, opt_player);
 else fill_circle(COLOR_CYAN, player.x + TILE/2.0f, player.y + TILE/2.0f, TILE*0.35f);
 
-// 怪物
+// Monster sprite or fallback
 if (bitmap_valid(monster_bmp)) draw_bitmap(monster_bmp, monster.x, monster.y, opt_monster);
 else fill_circle(COLOR_RED, monster.x + TILE/2.0f, monster.y + TILE/2.0f, TILE*0.35f);
 
 refresh_screen(60);
 
 
-            // 地图
+            // Map drawing again in the standard path
             for (int r=0;r<H;++r)
             for (int c=0;c<W;++c)
             {
@@ -461,15 +461,15 @@ refresh_screen(60);
                 }
             }
 
-            // 玩家
+            // Player drawing
             if (bitmap_valid(player_bmp)) draw_bitmap(player_bmp, player.x, player.y, opt_player);
             else fill_circle(COLOR_CYAN, player.x + TILE/2.0f, player.y + TILE/2.0f, TILE*0.35f);
 
-            // 怪物
+            // Monster drawing
             if (bitmap_valid(monster_bmp)) draw_bitmap(monster_bmp, monster.x, monster.y, opt_monster);
             else fill_circle(COLOR_RED, monster.x + TILE/2.0f, monster.y + TILE/2.0f, TILE*0.35f);
 
-            // 叠加胜利/失败界面
+            // Overlay win or loss text after the scene is drawn
             if (victory) {
                 draw_text("YOU WIN!", COLOR_YELLOW, "arial", 32, 12, 10);
                 draw_text("Press Y: next / N: quit", COLOR_WHITE, "arial", 22, 12, 50);
