@@ -201,6 +201,19 @@ def _validate_maze_shape(g: List[List[int]]) -> None:
                 raise ValueError(f"maze[{r}][{c}] must be 0/1, got {v}")
 
 
+def sample_random_roads_from_file(path: str, k: int = 1, seed: Optional[int] = None):
+    g = _read_json_maze(path)
+    H, W = len(g), len(g[0])
+    roads = [(r, c) for r in range(H) for c in range(W) if g[r][c] == ROAD]
+    if not roads or k <= 0:
+        return []
+
+    rng = random.Random(seed) if seed is not None else random
+    rng.shuffle(roads)
+    roads = roads[:min(k, len(roads))]
+    return [{"r": r, "c": c} for r, c in roads]
+
+
 def astar_next_step(g: List[List[int]], start: Tuple[int, int], goal: Tuple[int, int]) -> Tuple[int, int]:
     """
     Compute the *next* step from `start` toward `goal` using A* with 4-neighborhood (Manhattan).
@@ -318,6 +331,13 @@ def main():
     parser = argparse.ArgumentParser(description="Maze generator & A* next-step")
     sub = parser.add_subparsers(dest="cmd")
 
+    # Subcommand: sample coin positions on ROAD cells (optional utility)
+    ploot = sub.add_parser("loot", help="sample k coin positions on ROAD cells")
+    ploot.add_argument("--maze", type=str, default="maze.json")
+    ploot.add_argument("--k", type=int, default=1)
+    ploot.add_argument("--seed", type=int, default=None)
+
+
     # Subcommand: generate a maze file
     pgen = sub.add_parser("generate", help="generate maze.json")
     pgen.add_argument("--H", type=int, default=20, help="maze height (cells, recommended odd >= 5)")
@@ -367,6 +387,13 @@ def main():
             ensure_ascii=False
         ))
         return
+    
+    
+    if args.cmd == "loot":
+        coins = sample_random_roads_from_file(args.maze, args.k, args.seed)
+        print(json.dumps({"coins": coins}, ensure_ascii=False))
+        return
+
 
     if args.cmd == "next-step":
         # Load and validate maze; also validate coordinates are within range.

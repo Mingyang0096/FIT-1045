@@ -1,190 +1,167 @@
-// main.cpp
+// main.cpp — Maze + Coins + Regenerate Map + Frozen End-Stats
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <random>
-#include <cstdio>
 #include <stdexcept>
-#include <array>
 #include <sstream>
-#include <filesystem>
-#include <iomanip>   // std::quoted
-#include <future>
 #include <chrono>
 #include <algorithm>
+#include <set>
+#include <queue>     // for std::priority_queue
+#include <cstdlib>   // for std::system
+#include <cmath>     // for std::abs
 
 #include "splashkit.h"
 #include "nlohmann/json.hpp"
 
+using std::string;
+using std::vector;
+using std::pair;
+
 static const int WALL = 1;
 static const int ROAD = 0;
 
-// Load the top level two dimensional array from a json file
-std::vector<std::vector<int>> load_maze(const std::string &path)
+// ---------- Tunables ----------
+static int   TILE         = 32;
+static int   PADDING      = 0;
+static float PLAYER_SPEED = 160.0f;   // px/s
+static float MONSTER_SPEED= 140.0f;   // px/s
+static int   NUM_COINS    = 20;        // coins per round
+static int   COIN_VALUE   = 100;      // score per coin
+static float PICK_RADIUS  = 0.48f;    // in tiles
+static int   FPS_LIMIT    = 60;       // refresh FPS
+// -----------------------------
+
+// px <-> cell helpers
+inline float cell_to_px_c(int c) { return (float)(c * TILE + PADDING); }
+inline float cell_to_px_r(int r) { return (float)(r * TILE + PADDING); }
+
+// scale any bitmap to TILE size
+inline drawing_options make_tile_scale(bitmap bmp)
+{
+    if (!bitmap_valid(bmp)) return option_defaults();
+    double bw = (double)bitmap_width(bmp);
+    double bh = (double)bitmap_height(bmp);
+    double sx = TILE / (bw > 0 ? bw : 1.0);
+    double sy = TILE / (bh > 0 ? bh : 1.0);
+    return option_scale_bmp(sx, sy);
+}
+
+// read maze: top-level 2D int array
+vector<vector<int>> load_maze(const string &path)
 {
     std::ifstream in(path);
     if (!in.is_open()) throw std::runtime_error("cannot open: " + path);
 
-    nlohmann::json nj;
-    in >> nj;
-
+    nlohmann::json nj; in >> nj;
     if (!nj.is_array() || nj.empty() || !nj[0].is_array())
         throw std::runtime_error("maze.json must be a 2D array");
 
-    std::vector<std::vector<int>> g;
-    g.reserve(nj.size());
+    vector<vector<int>> g; g.reserve(nj.size());
     for (auto &row : nj)
     {
-        std::vector<int> r;
-        r.reserve(row.size());
-        for (auto &v : row) r.push_back(v.get<int>());
+        vector<int> r; r.reserve(row.size());
+        for (auto &x : row) r.push_back((int)x);
         g.push_back(std::move(r));
     }
     return g;
 }
 
-// Find the single exit cell which must be the only ROAD on the border
-std::pair<int,int> find_exit_cell(const std::vector<std::vector<int>> &g)
+// find the unique border exit (r,c)
+pair<int,int> find_single_exit(const vector<vector<int>>& g)
 {
-    int H = (int)g.size(), W = (int)g[0].size();
-    std::vector<std::pair<int,int>> exits;
-    // Top and bottom borders
+    int H=(int)g.size(), W=(int)g[0].size();
+    vector<pair<int,int>> exits;
     for (int c=0;c<W;++c){
-        if (g[0][c]==ROAD) exits.emplace_back(0,c);
+        if (g[0][c]==ROAD)   exits.emplace_back(0,c);
         if (g[H-1][c]==ROAD) exits.emplace_back(H-1,c);
     }
-    // Left and right borders
     for (int r=0;r<H;++r){
-        if (g[r][0]==ROAD) exits.emplace_back(r,0);
+        if (g[r][0]==ROAD)   exits.emplace_back(r,0);
         if (g[r][W-1]==ROAD) exits.emplace_back(r,W-1);
     }
     if (exits.size()!=1) throw std::runtime_error("maze border must contain exactly one exit");
     return exits[0];
 }
 
-// Pick a random road cell from all ROAD cells
-std::pair<int,int> random_road(const std::vector<std::vector<int>> &g, std::mt19937 &rng)
+// pick a random ROAD cell
+pair<int,int> random_road(const vector<vector<int>> &g, std::mt19937 &rng)
 {
-    int H = (int)g.size(), W = (int)g[0].size();
-    std::vector<std::pair<int,int>> roads;
-    roads.reserve(H*W);
-    for (int r=0;r<H;++r)
-        for (int c=0;c<W;++c)
-            if (g[r][c]==ROAD) roads.emplace_back(r,c);
-    if (roads.empty()) throw std::runtime_error("no road cell in maze");
-    std::uniform_int_distribution<int> dist(0, (int)roads.size()-1);
+    int H=(int)g.size(), W=(int)g[0].size();
+    vector<pair<int,int>> roads; roads.reserve(H*W/2);
+    for (int r=0;r<H;++r) for (int c=0;c<W;++c)
+        if (g[r][c]==ROAD) roads.emplace_back(r,c);
+    if (roads.empty()) throw std::runtime_error("no ROAD cells");
+    std::uniform_int_distribution<> dist(0,(int)roads.size()-1);
     return roads[dist(rng)];
 }
 
-// Call the python script in a blocking way and parse returned json
-nlohmann::json run_python_next_step(const std::string &maze_path, int from_r, int from_c, int to_r, int to_c)
+// 判断文件是否存在（跨平台简易法）
+static bool file_exists(const std::string& path)
 {
-    std::ostringstream cmd;
-    cmd << "python generator.py next-step"
-        << " --maze " << std::quoted(maze_path)
-        << " --from " << from_r << ' ' << from_c
-        << " --to "   << to_r   << ' ' << to_c;
-
-#if defined(_WIN32)
-    FILE *pipe = _popen(cmd.str().c_str(), "r");
-#else
-    FILE *pipe = popen(cmd.str().c_str(), "r");
-#endif
-    if (!pipe) throw std::runtime_error("failed to run python next-step");
-
-    std::string output;
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), (int)buf.size(), pipe)) output += buf.data();
-
-#if defined(_WIN32)
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
-
-    if (output.empty()) throw std::runtime_error("python next-step returned empty output");
-    return nlohmann::json::parse(output);
+    std::ifstream f(path);
+    return (bool)f;
 }
 
-// Ask python to generate maze.json with given size and loop density
-void run_python_generate_maze(const std::string &out_path, int H, int W, double loop_density = 0.08)
+// 调用 Python 生成 maze.json（失败返回 false）
+// 会尝试 `python`，失败再试 `python3`
+static bool generate_maze_via_python(const std::string& out_path, int H, int W, int seed = -1)
 {
     std::ostringstream cmd;
-    cmd << "python generator.py generate"
-        << " --H " << H
+    cmd << "python generator.py generate --H " << H
         << " --W " << W
-        << " --loop " << loop_density
-        << " --out " << std::quoted(out_path);
-#if defined(_WIN32)
-    FILE *pipe = _popen(cmd.str().c_str(), "r");
-#else
-    FILE *pipe = popen(cmd.str().c_str(), "r");
-#endif
-    if (!pipe) throw std::runtime_error("failed to run python generate");
-    char buf[256];
-    while (fgets(buf, (int)sizeof(buf), pipe)) { /* You can print logs here such as puts with buf */ }
-#if defined(_WIN32)
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
+        << " --out " << out_path;
+    if (seed >= 0) cmd << " --seed " << seed;
+
+    int ret = std::system(cmd.str().c_str());
+    if (ret != 0) {
+        std::ostringstream cmd2;
+        cmd2 << "python3 generator.py generate --H " << H
+             << " --W " << W
+             << " --out " << out_path;
+        if (seed >= 0) cmd2 << " --seed " << seed;
+        ret = std::system(cmd2.str().c_str());
+    }
+    return file_exists(out_path);
 }
 
-// Smooth mover that operates on grid cells with pixel interpolation for rendering
+
+// movement actor with tween
 struct Mover {
-    // Grid coordinates in cell units
-    int r{0}, c{0};
-    int tr{0}, tc{0};     // Target cell to commit to r and c after movement completes
-
-    // Pixel coordinates for rendering
-    float x{0}, y{0};
-    float sx{0}, sy{0};   // Pixel start position
-    float tx{0}, ty{0};   // Pixel target position
-
-    // Progress from zero to one
-    float t{0};
-    bool moving{false};
-
-    // Speed in pixels per second
-    float speed{160.0f};  // Player default is one hundred sixty pixels per second. With TILE as thirty two this is five cells per second
+    int r{0}, c{0};       // current cell
+    int tr{0}, tc{0};     // target cell
+    float x{0}, y{0};     // current px
+    float sx{0}, sy{0};   // start px
+    float tx{0}, ty{0};   // target px
+    float t{0};           // 0..1
+    bool  moving{false};
+    float speed{160.0f};  // px/s
 };
 
-static int TILE = 32;
-static int PADDING = 0;
-
-inline float cell_to_px_c(int c) { return (float)(c * TILE + PADDING); }
-inline float cell_to_px_r(int r) { return (float)(r * TILE + PADDING); }
+void place_at_cell(Mover &m, int r, int c)
+{
+    m.r=r; m.c=c; m.tr=r; m.tc=c;
+    m.x=cell_to_px_c(c); m.y=cell_to_px_r(r);
+    m.sx=m.tx=m.x; m.sy=m.ty=m.y;
+    m.t=0.0f; m.moving=false;
+}
 
 void start_move(Mover &m, int nr, int nc)
 {
-    m.tr = nr; m.tc = nc;
-    m.sx = m.x; m.sy = m.y;
-    m.tx = cell_to_px_c(nc);
-    m.ty = cell_to_px_r(nr);
-    m.t  = 0.0f;
-    m.moving = true;
-}
-
-void snap_to_cell(Mover &m) // Immediately align pixel position to current r and c
-{
-    m.tr = m.r; m.tc = m.c;
-    m.x = cell_to_px_c(m.c);
-    m.y = cell_to_px_r(m.r);
-    m.sx = m.x; m.sy = m.y;
-    m.tx = m.x; m.ty = m.y;
-    m.t = 0.0f;
-    m.moving = false;
+    m.tr=nr; m.tc=nc;
+    m.sx=m.x; m.sy=m.y;
+    m.tx=cell_to_px_c(nc); m.ty=cell_to_px_r(nr);
+    m.t=0.0f; m.moving=true;
 }
 
 void update_mover(Mover &m, float dt)
 {
     if (!m.moving) return;
-    // Speed is in pixels per second. One cell takes TILE pixels. Therefore t increases by speed times dt divided by TILE
     m.t += (m.speed * dt) / (float)TILE;
     if (m.t >= 1.0f) {
-        m.t = 1.0f;
-        m.moving = false;
+        m.t = 1.0f; m.moving=false;
         m.r = m.tr; m.c = m.tc;
         m.x = m.tx; m.y = m.ty;
     } else {
@@ -193,301 +170,341 @@ void update_mover(Mover &m, float dt)
     }
 }
 
+// A*: return next step only
+pair<int,int> astar_next_step(const vector<vector<int>>& g, pair<int,int> s, pair<int,int> t)
+{
+    if (s==t) return s;
+    const int H = (int)g.size(), W = (int)g[0].size();
+    auto inb = [&](int r,int c){ return 0<=r && r<H && 0<=c && c<W; };
+    auto h   = [&](int r,int c){ return std::abs(r-t.first)+std::abs(c-t.second); };
+    static const int DR[4]={-1,1,0,0};
+    static const int DC[4]={0,0,-1,1};
+
+    struct Node{int r,c,g,f;};
+    struct Cmp{
+        bool operator()(const Node&a, const Node&b)const{
+            return (a.f>b.f) || (a.f==b.f && a.g>b.g);
+        }
+    };
+
+    std::vector<std::vector<int>> gscore(H, std::vector<int>(W, 1<<29));
+    std::vector<std::vector<pair<int,int>>> came(H, std::vector<pair<int,int>>(W, {-1,-1}));
+    std::priority_queue<Node, std::vector<Node>, Cmp> pq;
+
+    gscore[s.first][s.second]=0;
+    pq.push({s.first,s.second,0,h(s.first,s.second)});
+
+    while(!pq.empty()){
+        auto cur = pq.top(); pq.pop();
+        if (cur.r==t.first && cur.c==t.second) break;
+        for(int k=0;k<4;++k){
+            int rr=cur.r+DR[k], cc=cur.c+DC[k];
+            if(!inb(rr,cc) || g[rr][cc]==WALL) continue;
+            int ng=cur.g+1;
+            if (ng<gscore[rr][cc]){
+                gscore[rr][cc]=ng;
+                came[rr][cc]={cur.r,cur.c};
+                int nf=ng+h(rr,cc);
+                pq.push({rr,cc,ng,nf});
+            }
+        }
+    }
+
+    auto target=t;
+    if (came[target.first][target.second].first==-1){ // unreachable
+        int bestf=1<<30; pair<int,int> best=s;
+        for(int r=0;r<H;++r) for(int c=0;c<W;++c){
+            if (gscore[r][c]<(1<<29)){
+                int f=gscore[r][c]+h(r,c);
+                if (f<bestf){bestf=f; best={r,c};}
+            }
+        }
+        target=best; if (target==s) return s;
+    }
+    // backtrack to s; take next step
+    pair<int,int> cur=target;
+    vector<pair<int,int>> path;
+    while(!(cur==s)){
+        path.push_back(cur);
+        auto p=came[cur.first][cur.second];
+        if (p.first==-1) break;
+        cur=p;
+    }
+    if (path.empty()) return s;
+    return path.back();
+}
+
+// coin
+struct Coin { int r{0}, c{0}; bool collected{false}; };
+
+inline bool walkable(const vector<vector<int>>& g, int r, int c){
+    return 0<=r && r<(int)g.size() && 0<=c && c<(int)g[0].size() && g[r][c]==ROAD;
+}
+
 int main()
 {
-    try {
-        std::cout << "cwd: " << std::filesystem::current_path().string() << "\n";
-        const std::string maze_file = "maze.json";
+    try{
+        // 若一开始没有 maze.json，则先自动生成一张
+        const std::string maze_path = "maze.json";
+        // 你想要的默认尺寸（建议奇数更规整）；可按需改
+        const int GEN_H = 25;
+        const int GEN_W = 25;
 
-        // Auto generate the map on first run if the file is missing or cannot be read
-        if (!std::filesystem::exists(maze_file)) {
-            // No file on first run. Generate default twenty by twenty
-            run_python_generate_maze(maze_file, 20, 20, 0.08);
+        if (!file_exists(maze_path)) {
+            // 可选：给个随机 seed，保证每次首次运行都不同
+            std::random_device rd; std::mt19937 rng(rd());
+            int seed = std::uniform_int_distribution<int>(0, 1'000'000'000)(rng);
+
+            bool ok = generate_maze_via_python(maze_path, GEN_H, GEN_W, seed);
+            if (!ok) {
+                std::cerr << "ERROR: maze.json not found, and auto-generation failed. "
+                            "Make sure generator.py is next to the executable.\n";
+                return 1;
+            }
         }
 
-        std::vector<std::vector<int>> maze;
-        try {
-            maze = load_maze(maze_file);
-        } catch (...) {
-            // File exists but is corrupted or has a wrong format. Regenerate and read again
-            run_python_generate_maze(maze_file, 20, 20, 0.08);
-            maze = load_maze(maze_file);
-        }
+        // 现在一定有 maze.json 了，再加载
+        auto maze = load_maze(maze_path);
 
-        int H = (int)maze.size();
-        int W = (int)maze[0].size();
-        auto exit_cell = find_exit_cell(maze);
-        int exit_r = exit_cell.first, exit_c = exit_cell.second;
+        // initial maze load (you can create one with: python generator.py generate)
+        const int INIT_H=(int)maze.size(), INIT_W=(int)maze[0].size();
 
-        // Screen setup
-        TILE = 32;
-        PADDING = 0;
-        const int SCR_W = W * TILE + PADDING*2;
-        const int SCR_H = H * TILE + PADDING*2;
-        open_window("Maze Chase (smooth + async A*)", SCR_W, SCR_H);
+        // window built for initial size; we keep H/W constant when regenerating
+        const int SCR_W = INIT_W*TILE + PADDING*2;
+        const int SCR_H = INIT_H*TILE + PADDING*2;
+        open_window("Maze + Coins", SCR_W, SCR_H);
 
-        // Textures and sprites
+        // textures
         bitmap floor_bmp   = load_bitmap("floor",   "Floor.bmp");
         bitmap wall_bmp    = load_bitmap("wall",    "Wall.bmp");
         bitmap player_bmp  = load_bitmap("player",  "Player.bmp");
         bitmap monster_bmp = load_bitmap("monster", "Monster.png");
+        bitmap gold_bmp    = load_bitmap("gold",    "Gold.png");
 
-        auto scale_for = [&](bitmap bmp)->drawing_options {
-            if (bitmap_valid(bmp))
-            {
-                double bw = (double)bitmap_width(bmp);
-                double bh = (double)bitmap_height(bmp);
-                double sx = TILE / std::max(1.0, bw);
-                double sy = TILE / std::max(1.0, bh);
-                return option_scale_bmp(sx, sy);
-            }
-            return option_defaults();
-        };
-        drawing_options opt_floor   = scale_for(floor_bmp);
-        drawing_options opt_wall    = scale_for(wall_bmp);
-        drawing_options opt_player  = scale_for(player_bmp);
-        drawing_options opt_monster = scale_for(monster_bmp);
+        // scales
+        drawing_options opt_floor   = make_tile_scale(floor_bmp);
+        drawing_options opt_wall    = make_tile_scale(wall_bmp);
+        drawing_options opt_player  = make_tile_scale(player_bmp);
+        drawing_options opt_monster = make_tile_scale(monster_bmp);
+        drawing_options opt_gold    = make_tile_scale(gold_bmp);
 
-        // Spawn points for player and monster on road cells
         std::random_device rd; std::mt19937 rng(rd());
+
+        auto exit_cell = find_single_exit(maze);
         auto pspawn = random_road(maze, rng);
         auto mspawn = random_road(maze, rng);
-        while (mspawn == pspawn) mspawn = random_road(maze, rng);
+        while (mspawn==pspawn || mspawn==exit_cell) mspawn = random_road(maze, rng);
 
-        Mover player;
-        player.r = player.tr = pspawn.first;
-        player.c = player.tc = pspawn.second;
-        player.x = cell_to_px_c(player.c);
-        player.y = cell_to_px_r(player.r);
-        player.speed = 180.0f; // Player is a little faster which is about five point six cells per second
+        Mover player, monster;
+        place_at_cell(player,  pspawn.first, pspawn.second);
+        place_at_cell(monster, mspawn.first, mspawn.second);
+        player.speed  = PLAYER_SPEED;
+        monster.speed = MONSTER_SPEED;
 
-        Mover monster;
-        monster.r = monster.tr = mspawn.first;
-        monster.c = monster.tc = mspawn.second;
-        monster.x = cell_to_px_c(monster.c);
-        monster.y = cell_to_px_r(monster.r);
-        monster.speed = 140.0f; // Monster is slightly slower
+        vector<Coin> coins;
+        int coins_collected = 0;
+        int score = 0;
 
-        bool game_over = false;
-        bool victory   = false;
+        // 🔒 冻结的结算数据（避免被重置后显示为空）
+        int  last_coins_collected = 0;
+        int  last_score = 0;
+        bool end_stats_ready = false;
 
-        // Asynchronous AI. Request a star periodically so the main loop is never blocked
-        const double AI_INTERVAL = 0.18; // Seconds. A smaller value tracks more closely
-        double ai_accum = 0.0;
-        bool ai_running = false;
-        std::future<nlohmann::json> ai_future;
-
-        auto request_ai = [&]() {
-            ai_running = true;
-            ai_future = std::async(std::launch::async, [&]() {
-                try {
-                    return run_python_next_step(maze_file, monster.r, monster.c, player.r, player.c);
-                } catch (...) {
-                    return nlohmann::json{};
-                }
-            });
+        auto respawn_coins = [&](const pair<int,int>& p, const pair<int,int>& m){
+            std::set<pair<int,int>> used{p, m, exit_cell};
+            coins.clear();
+            for (int i=0;i<NUM_COINS;++i){
+                auto cs = random_road(maze, rng);
+                while (used.count(cs)) cs = random_road(maze, rng);
+                used.insert(cs);
+                coins.push_back(Coin{cs.first, cs.second, false});
+            }
+            coins_collected = 0;
+            score = 0;
         };
+        respawn_coins(pspawn, mspawn);
 
+        bool victory=false, game_over=false;
+
+        // regenerate maze of same size, then reset everything
         auto reset_round = [&](){
-            // Regenerate the maze then reload it and reset state while keeping the current size
-            run_python_generate_maze(maze_file, H, W, 0.08);
-            maze = load_maze(maze_file);
-            auto ex = find_exit_cell(maze);
-            exit_r = ex.first; exit_c = ex.second;
+            int H = INIT_H, W = INIT_W;
+            int seed = std::uniform_int_distribution<int>(0, 1'000'000'000)(rng);
 
-            pspawn = random_road(maze, rng);
-            mspawn = random_road(maze, rng);
-            while (mspawn == pspawn) mspawn = random_road(maze, rng);
+            std::ostringstream cmd;
+            cmd << "python generator.py generate --H " << H
+                << " --W " << W
+                << " --seed " << seed
+                << " --out maze.json";
+            int ret = std::system(cmd.str().c_str());
+            if (ret != 0) { // python3 fallback
+                std::ostringstream cmd2;
+                cmd2 << "python3 generator.py generate --H " << H
+                     << " --W " << W
+                     << " --seed " << seed
+                     << " --out maze.json";
+                ret = std::system(cmd2.str().c_str());
+            }
+            // reload
+            maze = load_maze("maze.json");
+            exit_cell = find_single_exit(maze);
 
-            player.r = player.tr = pspawn.first;
-            player.c = player.tc = pspawn.second;
-            snap_to_cell(player);
+            // respawn characters
+            auto np = random_road(maze, rng);
+            auto nm = random_road(maze, rng);
+            while (nm==np || nm==exit_cell) nm = random_road(maze, rng);
 
-            monster.r = monster.tr = mspawn.first;
-            monster.c = monster.tc = mspawn.second;
-            snap_to_cell(monster);
+            place_at_cell(player,  np.first, np.second);
+            place_at_cell(monster, nm.first, nm.second);
 
-            // Reset round state
-            game_over = false;
-            victory = false;
-            ai_accum = 0.0;
-            ai_running = false;
+            respawn_coins(np, nm);
+
+            // 清理结算态
+            victory=false; game_over=false;
+            end_stats_ready = false;
         };
 
-        // Frame timing
-        auto last = std::chrono::steady_clock::now();
+        auto t0 = std::chrono::high_resolution_clock::now();
 
-        while (!window_close_requested("Maze Chase (smooth + async A*)"))
+        while (!window_close_requested("Maze + Coins"))
         {
             process_events();
 
-            // Compute dt in seconds
-            auto now = std::chrono::steady_clock::now();
-            float dt = std::chrono::duration<float>(now - last).count();
-            last = now;
-            dt = std::min(dt, 0.05f); // Prevent extreme frame gaps that may cause tunneling
+            // dt
+            auto t1 = std::chrono::high_resolution_clock::now();
+            float dt = std::chrono::duration<float>(t1 - t0).count();
+            t0 = t1;
 
-            // Input handling while on win or loss screens takes priority
-            if (victory) {
-                if (key_typed(Y_KEY)) { reset_round(); }
-                else if (key_typed(N_KEY) || key_typed(ESCAPE_KEY)) { break; }
-            } else if (game_over) {
-                if (key_typed(Y_KEY)) { reset_round(); }
-                else if (key_typed(N_KEY) || key_typed(ESCAPE_KEY)) { break; }
-            } else {
-                // Player input. Grid to grid with smooth interpolation. Holding a direction keeps moving
-                if (!player.moving)
-                {
-                    int dr = 0, dc = 0;
-                    if (key_down(W_KEY) || key_down(UP_KEY))         dr = -1;
-                    else if (key_down(S_KEY) || key_down(DOWN_KEY))  dr = +1;
-                    else if (key_down(A_KEY) || key_down(LEFT_KEY))  dc = -1;
-                    else if (key_down(D_KEY) || key_down(RIGHT_KEY)) dc = +1;
+            // input -> grid move
+            if (!player.moving && !victory && !game_over){
+                int dr=0, dc=0;
+                if (key_down(W_KEY) || key_down(UP_KEY))         dr=-1;
+                else if (key_down(S_KEY) || key_down(DOWN_KEY))  dr=+1;
+                else if (key_down(A_KEY) || key_down(LEFT_KEY))  dc=-1;
+                else if (key_down(D_KEY) || key_down(RIGHT_KEY)) dc=+1;
+                int nr=player.r+dr, nc=player.c+dc;
+                if ((dr||dc) && walkable(maze,nr,nc)){
+                    start_move(player, nr,nc);
+                }
+            }
 
-                    int nr = player.r + dr, nc = player.c + dc;
-                    if (dr != 0 || dc != 0)
-                    {
-                        if (0 <= nr && nr < H && 0 <= nc && nc < W && maze[nr][nc] == ROAD)
-                            start_move(player, nr, nc);
+            // monster AI
+            if (!monster.moving && !victory && !game_over){
+                auto step = astar_next_step(maze, {monster.r,monster.c}, {player.r,player.c});
+                if (step != pair<int,int>{monster.r,monster.c}) {
+                    start_move(monster, step.first, step.second);
+                }
+            }
+
+            // tween updates
+            if (!victory && !game_over){
+                update_mover(player,  dt);
+                update_mover(monster, dt);
+            }
+
+            // coin pickup by player
+            if (!victory && !game_over){
+                float px = player.x + TILE*0.5f;
+                float py = player.y + TILE*0.5f;
+                float rad = PICK_RADIUS * TILE;
+                float rad2 = rad*rad;
+                for (auto &coin : coins){
+                    if (coin.collected) continue;
+                    float cx = cell_to_px_c(coin.c) + TILE*0.5f;
+                    float cy = cell_to_px_r(coin.r) + TILE*0.5f;
+                    float dx = px-cx, dy=py-cy;
+                    if (dx*dx+dy*dy <= rad2){
+                        coin.collected=true;
+                        ++coins_collected;
+                        score += COIN_VALUE;
                     }
                 }
+            }
 
-                // Monster movement uses the previously computed target. If none is available it waits for AI
-                if (!monster.moving)
-                {
-                    if (ai_running &&
-                        ai_future.valid() &&
-                        ai_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
-                    {
-                        auto j = ai_future.get();
-                        ai_running = false;
-                        ai_accum = 0.0;
-
-                        if (j.is_object() && j.contains("next"))
-                        {
-                            int nr2 = j["next"]["r"].get<int>();
-                            int nc2 = j["next"]["c"].get<int>();
-                            if (0 <= nr2 && nr2 < H && 0 <= nc2 && nc2 < W && maze[nr2][nc2] == ROAD)
-                                start_move(monster, nr2, nc2);
-                        }
-                    }
+            // win/lose checks
+            if (!victory && !game_over){
+                if (!player.moving && player.r==exit_cell.first && player.c==exit_cell.second){
+                    victory = true;
                 }
-
-                // Accumulate AI scheduling time and trigger a new request when the interval elapses and no request is running
-                ai_accum += dt;
-                if (!ai_running && ai_accum >= AI_INTERVAL) request_ai();
+                if (!player.moving && !monster.moving && player.r==monster.r && player.c==monster.c){
+                    game_over = true;
+                }
             }
 
-            // Update smooth movement for both entities
-            update_mover(player, dt);
-            update_mover(monster, dt);
-
-            // Win and loss checks. Win has priority over loss
-            if (!victory && player.r == exit_r && player.c == exit_c) {
-                victory = true;
-                ai_running = false;  // Stop further AI
-            }
-            if (!victory && !game_over && player.r == monster.r && player.c == monster.c) {
-                game_over = true;
-                ai_running = false;
+            // 一旦进入结算，冻结本局统计，后续不再变
+            if ((victory || game_over) && !end_stats_ready){
+                last_coins_collected = coins_collected;
+                last_score = score;
+                end_stats_ready = true;
             }
 
-        // Rendering starts here
-        if (victory || game_over)
-        {
-            // Clear the screen first and draw only the informational text
+            // render
             clear_screen(COLOR_BLACK);
 
-            if (victory) {
-                draw_text("YOU WIN!", COLOR_YELLOW, "arial", 32, 12, 10);
-                draw_text("Press Y: next / N: quit", COLOR_WHITE, "arial", 22, 12, 50);
-            } else { // game_over
-                draw_text("GAME OVER", COLOR_YELLOW, "arial", 32, 12, 10);
-                draw_text("Press Y: retry / N: quit", COLOR_WHITE, "arial", 22, 12, 50);
-            }
-
-            refresh_screen(60);
-            // Skip map and actor rendering for this frame to keep a clean text overlay
-            continue; 
-        }
-
-        // Normal rendering of map and actors. This path is not used on win or loss frames
-        clear_screen(COLOR_BLACK);
-
-// Map tiles
-for (int r=0;r<H;++r)
-for (int c=0;c<W;++c)
-{
-    float x = (float)(c * TILE + PADDING);
-    float y = (float)(r * TILE + PADDING);
-    if (maze[r][c] == WALL)
-    {
-        if (bitmap_valid(wall_bmp)) draw_bitmap(wall_bmp, x, y, opt_wall);
-        else fill_rectangle(rgba_color(35,35,40,255), x, y, TILE-1, TILE-1);
-    }
-    else
-    {
-        if (bitmap_valid(floor_bmp)) draw_bitmap(floor_bmp, x, y, opt_floor);
-        else fill_rectangle(rgba_color(220,220,220,255), x, y, TILE-1, TILE-1);
-    }
-}
-
-// Player sprite or fallback
-if (bitmap_valid(player_bmp)) draw_bitmap(player_bmp, player.x, player.y, opt_player);
-else fill_circle(COLOR_CYAN, player.x + TILE/2.0f, player.y + TILE/2.0f, TILE*0.35f);
-
-// Monster sprite or fallback
-if (bitmap_valid(monster_bmp)) draw_bitmap(monster_bmp, monster.x, monster.y, opt_monster);
-else fill_circle(COLOR_RED, monster.x + TILE/2.0f, monster.y + TILE/2.0f, TILE*0.35f);
-
-refresh_screen(60);
-
-
-            // Map drawing again in the standard path
-            for (int r=0;r<H;++r)
-            for (int c=0;c<W;++c)
-            {
-                float x = (float)(c * TILE + PADDING);
-                float y = (float)(r * TILE + PADDING);
-                if (maze[r][c] == WALL)
-                {
-                    if (bitmap_valid(wall_bmp)) draw_bitmap(wall_bmp, x, y, opt_wall);
-                    else fill_rectangle(rgba_color(35,35,40,255), x, y, TILE-1, TILE-1);
-                }
-                else
-                {
-                    if (bitmap_valid(floor_bmp)) draw_bitmap(floor_bmp, x, y, opt_floor);
-                    else fill_rectangle(rgba_color(220,220,220,255), x, y, TILE-1, TILE-1);
+            // map
+            int H=(int)maze.size(), W=(int)maze[0].size();
+            for (int r=0;r<H;++r) for(int c=0;c<W;++c){
+                float x=cell_to_px_c(c), y=cell_to_px_r(r);
+                if (bitmap_valid(floor_bmp)) draw_bitmap(floor_bmp, x,y, opt_floor);
+                else fill_rectangle(COLOR_GRAY, x,y, TILE,TILE);
+                if (maze[r][c]==WALL){
+                    if (bitmap_valid(wall_bmp)) draw_bitmap(wall_bmp, x,y, opt_wall);
+                    else fill_rectangle(COLOR_DARK_GREEN, x,y, TILE,TILE);
                 }
             }
 
-            // Player drawing
+            // coins (only in play)
+            if (!victory && !game_over){
+                for (const auto &coin: coins){
+                    if (coin.collected) continue;
+                    float x=cell_to_px_c(coin.c), y=cell_to_px_r(coin.r);
+                    if (bitmap_valid(gold_bmp)) draw_bitmap(gold_bmp, x,y, opt_gold);
+                    else fill_circle(COLOR_YELLOW, x+TILE*0.5f, y+TILE*0.5f, TILE*0.30f);
+                }
+            }
+
+            // actors
             if (bitmap_valid(player_bmp)) draw_bitmap(player_bmp, player.x, player.y, opt_player);
-            else fill_circle(COLOR_CYAN, player.x + TILE/2.0f, player.y + TILE/2.0f, TILE*0.35f);
-
-            // Monster drawing
+            else fill_rectangle(COLOR_BLUE, player.x, player.y, TILE,TILE);
             if (bitmap_valid(monster_bmp)) draw_bitmap(monster_bmp, monster.x, monster.y, opt_monster);
-            else fill_circle(COLOR_RED, monster.x + TILE/2.0f, monster.y + TILE/2.0f, TILE*0.35f);
+            else fill_rectangle(COLOR_RED, monster.x, monster.y, TILE,TILE);
 
-            // Overlay win or loss text after the scene is drawn
-            if (victory) {
-                draw_text("YOU WIN!", COLOR_YELLOW, "arial", 32, 12, 10);
-                draw_text("Press Y: next / N: quit", COLOR_WHITE, "arial", 22, 12, 50);
-            } else if (game_over) {
-                draw_text("GAME OVER", COLOR_YELLOW, "arial", 32, 12, 10);
-                draw_text("Press Y: retry / N: quit", COLOR_WHITE, "arial", 22, 12, 50);
+            // HUD during play
+            if (!victory && !game_over){
+                std::ostringstream hud; hud<<"Coins "<<coins_collected<<"/"<<NUM_COINS<<"   Score "<<score;
+                draw_text(hud.str(), COLOR_WHITE, "arial", 18, 8, 8);
             }
 
-            refresh_screen(60);
+            // end screens (use FROZEN stats)
+            if (victory || game_over){
+                clear_screen(color_black());
+                if (victory){
+                    draw_text("YOU WIN!", COLOR_RED, "arial", 32, 12, 10);
+                    draw_text("Press Y: next / N: quit", COLOR_WHITE, "arial", 22, 12, 50);
+                } else {
+                    draw_text("GAME OVER", COLOR_RED, "arial", 32, 12, 10);
+                    draw_text("Press Y: retry / N: quit", COLOR_WHITE, "arial", 22, 12, 50);
+                }
+                std::ostringstream ss;
+                ss << "Coins: " << last_coins_collected << "   Score: " << last_score;
+                draw_text(ss.str(), COLOR_RED, "arial", 22, 12, 86);
+
+                if (key_typed(Y_KEY))      reset_round();
+                else if (key_typed(N_KEY) || key_typed(ESCAPE_KEY)) break;
+            }
+
+            refresh_screen(FPS_LIMIT);
         }
 
+        // free bitmaps
         if (bitmap_valid(floor_bmp))   free_bitmap(floor_bmp);
         if (bitmap_valid(wall_bmp))    free_bitmap(wall_bmp);
         if (bitmap_valid(player_bmp))  free_bitmap(player_bmp);
         if (bitmap_valid(monster_bmp)) free_bitmap(monster_bmp);
+        if (bitmap_valid(gold_bmp))    free_bitmap(gold_bmp);
 
-    } catch (const std::exception &e) {
-        std::cerr << "ERROR: " << e.what() << "\n";
+    }catch(const std::exception& e){
+        std::cerr<<"ERROR: "<<e.what()<<"\n";
         return 1;
     }
     return 0;
