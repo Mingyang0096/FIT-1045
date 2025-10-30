@@ -98,36 +98,6 @@ pair<int,int> random_road(const vector<vector<int>> &g, std::mt19937 &rng)
     return roads[dist(rng)];
 }
 
-// 判断文件是否存在（跨平台简易法）
-static bool file_exists(const std::string& path)
-{
-    std::ifstream f(path);
-    return (bool)f;
-}
-
-// 调用 Python 生成 maze.json（失败返回 false）
-// 会尝试 `python`，失败再试 `python3`
-static bool generate_maze_via_python(const std::string& out_path, int H, int W, int seed = -1)
-{
-    std::ostringstream cmd;
-    cmd << "python generator.py generate --H " << H
-        << " --W " << W
-        << " --out " << out_path;
-    if (seed >= 0) cmd << " --seed " << seed;
-
-    int ret = std::system(cmd.str().c_str());
-    if (ret != 0) {
-        std::ostringstream cmd2;
-        cmd2 << "python3 generator.py generate --H " << H
-             << " --W " << W
-             << " --out " << out_path;
-        if (seed >= 0) cmd2 << " --seed " << seed;
-        ret = std::system(cmd2.str().c_str());
-    }
-    return file_exists(out_path);
-}
-
-
 // movement actor with tween
 struct Mover {
     int r{0}, c{0};       // current cell
@@ -170,7 +140,7 @@ void update_mover(Mover &m, float dt)
     }
 }
 
-// A*: return next step
+// A*: return next step only
 pair<int,int> astar_next_step(const vector<vector<int>>& g, pair<int,int> s, pair<int,int> t)
 {
     if (s==t) return s;
@@ -244,29 +214,20 @@ inline bool walkable(const vector<vector<int>>& g, int r, int c){
 int main()
 {
     try{
-        // 若一开始没有 maze.json，则先自动生成一张
-        const std::string maze_path = "maze.json";
-        // 你想要的默认尺寸（建议奇数更规整）；可按需改
-        const int GEN_H = 25;
-        const int GEN_W = 25;
-
-        if (!file_exists(maze_path)) {
-            // 可选：给个随机 seed，保证每次首次运行都不同
-            std::random_device rd; std::mt19937 rng(rd());
-            int seed = std::uniform_int_distribution<int>(0, 1'000'000'000)(rng);
-
-            bool ok = generate_maze_via_python(maze_path, GEN_H, GEN_W, seed);
-            if (!ok) {
-                std::cerr << "ERROR: maze.json not found, and auto-generation failed. "
-                            "Make sure generator.py is next to the executable.\n";
-                return 1;
+            // --- ensure maze.json exists (create on first run) ---
+            std::ifstream probe("maze.json");
+            if (!probe.is_open()) {
+                // No maze.json: ask generator.py to create a default one.
+                int ret = std::system("python generator.py");       // default: writes maze.json
+                if (ret != 0) {
+                    ret = std::system("python3 generator.py");      // fallback
+                }
+                if (ret != 0) {
+                    throw std::runtime_error("Failed to generate maze.json via generator.py");
+                }
             }
-        }
-
-        // 现在一定有 maze.json 了，再加载
-        auto maze = load_maze(maze_path);
-
         // initial maze load (you can create one with: python generator.py generate)
+        auto maze = load_maze("maze.json");
         const int INIT_H=(int)maze.size(), INIT_W=(int)maze[0].size();
 
         // window built for initial size; we keep H/W constant when regenerating
@@ -277,7 +238,7 @@ int main()
         // textures
         bitmap floor_bmp   = load_bitmap("floor",   "Floor.bmp");
         bitmap wall_bmp    = load_bitmap("wall",    "Wall.bmp");
-        bitmap player_bmp  = load_bitmap("player",  "Player.bmp");
+        bitmap player_bmp  = load_bitmap("player",  "Player.png");
         bitmap monster_bmp = load_bitmap("monster", "Monster.png");
         bitmap gold_bmp    = load_bitmap("gold",    "Gold.png");
 
@@ -304,7 +265,6 @@ int main()
         vector<Coin> coins;
         int coins_collected = 0;
         int score = 0;
-
 
         int  last_coins_collected = 0;
         int  last_score = 0;
@@ -431,7 +391,7 @@ int main()
                 }
             }
 
-            // 一旦进入结算，冻结本局统计，后续不再变
+
             if ((victory || game_over) && !end_stats_ready){
                 last_coins_collected = coins_collected;
                 last_score = score;
@@ -479,15 +439,15 @@ int main()
             if (victory || game_over){
                 clear_screen(color_black());
                 if (victory){
-                    draw_text("YOU WIN!", COLOR_RED, "arial", 32, 12, 10);
+                    draw_text("YOU WIN!", COLOR_YELLOW, "arial", 32, 12, 10);
                     draw_text("Press Y: next / N: quit", COLOR_WHITE, "arial", 22, 12, 50);
                 } else {
-                    draw_text("GAME OVER", COLOR_RED, "arial", 32, 12, 10);
+                    draw_text("GAME OVER", COLOR_YELLOW, "arial", 32, 12, 10);
                     draw_text("Press Y: retry / N: quit", COLOR_WHITE, "arial", 22, 12, 50);
                 }
                 std::ostringstream ss;
                 ss << "Coins: " << last_coins_collected << "   Score: " << last_score;
-                draw_text(ss.str(), COLOR_RED, "arial", 22, 12, 86);
+                draw_text(ss.str(), COLOR_WHITE, "arial", 22, 12, 86);
 
                 if (key_typed(Y_KEY))      reset_round();
                 else if (key_typed(N_KEY) || key_typed(ESCAPE_KEY)) break;
